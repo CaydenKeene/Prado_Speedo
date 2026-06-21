@@ -1,0 +1,291 @@
+#pragma once
+// gauge_ui.h  —  LVGL v8.3.x  —  Prado cluster
+//
+// Two screens:
+//   1) GAUGE  — minimal "STEALTH" speedo: a thick full ring that fills with
+//      speed (full at 100) and a big centred number (capped at 99 -> 2 digits).
+//   2) DIAG   — the page "below" the gauge. Swipe UP on the gauge to reveal it,
+//      swipe DOWN to go back. Shows live car output (speed / pulse rate / edge
+//      count / calibration constant), a DEMO toggle, and a CALIBRATE button.
+//
+// The UI never talks to the speed driver directly; the .ino registers two
+// callbacks (calibrate, demo-toggle) and pushes live values via gauge_ui_set_diag().
+//
+// lv_conf.h needs: LV_FONT_MONTSERRAT_14/20/22, LV_USE_ARC, LV_USE_SWITCH,
+// LV_USE_BTN, LV_USE_FLEX (all on by default).
+
+#include "lvgl.h"
+#include "vehicle_data.h"
+#include <math.h>
+
+#define SPEED_RING_MAX  100   // ring is full at this speed
+#define SPEED_SHOW_MAX  99    // number never shows more than this (2 digits)
+
+// --- anti-jitter display tuning (Layer 3) -----------------------------------
+// DISPLAY_DEADBAND: the smoothed speed must move at least this many mph from the
+//   number currently shown before we change it -> kills flip-flop at rounding
+//   boundaries (e.g. 39<->40). DISPLAY_REFRESH_MS: how often the readout is even
+//   allowed to repaint (~8 Hz) regardless of how fast we tick.
+#define DISPLAY_DEADBAND   1.0f   // mph
+#define DISPLAY_REFRESH_MS 120    // ~8 Hz repaint cap
+
+// Big DIN-style speedo digits (Bahnschrift, 235px, glyphs 0-9). C linkage.
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const lv_font_t speed_font_lg;
+#ifdef __cplusplus
+}
+#endif
+
+// ----------------------------------------------------------- STEALTH palette --
+#define ST_BG   lv_color_hex(0x000000)
+#define ST_NUM  lv_color_hex(0xF2F2F2)
+#define ST_TRK  lv_color_hex(0x1A1A1A)   // dim ring track
+#define ST_IND  lv_color_hex(0xEDEDED)   // bright ring indicator
+#define ST_CAP  lv_color_hex(0x595959)   // captions
+#define ST_BTN  lv_color_hex(0x262626)   // button face
+
+// --------------------------------------------------------------- shared state -
+static lv_obj_t  *g_scr_gauge = NULL;   // page 1
+static lv_obj_t  *g_scr_diag  = NULL;   // page 2 (below)
+static lv_obj_t  *g_num;                // big speed number
+static lv_obj_t  *g_arc;                // ring
+static lv_coord_t g_d;                  // short edge of the display
+static uint32_t   g_boot_until = 0;     // hold live arc value until intro ends
+static uint32_t   g_toast_until = 0;
+static uint32_t   g_disp_next   = 0;    // next tick the readout may repaint (Layer 3)
+static int        g_shown       = 0;    // integer mph currently on screen
+
+// diag widgets
+static lv_obj_t  *d_speed, *d_hz, *d_pulses, *d_k, *d_demo_sw, *d_status;
+
+// app callbacks (set from the .ino)
+typedef void (*gauge_cal_cb_t)(void);
+typedef void (*gauge_demo_cb_t)(bool);
+static gauge_cal_cb_t  g_cal_cb  = NULL;
+static gauge_demo_cb_t g_demo_cb = NULL;
+inline void gauge_ui_set_calibrate_cb(gauge_cal_cb_t cb) { g_cal_cb  = cb; }
+inline void gauge_ui_set_demo_cb(gauge_demo_cb_t cb)     { g_demo_cb = cb; }
+
+// --------------------------------------------------------------- helpers ------
+static inline int ui_spd(const VehicleData &d) {
+  int s = (int)(d.speed_mph + 0.5f);
+  return s < 0 ? 0 : s;
+}
+
+static void ui_sweep_arc_cb(void *o, int32_t v) { lv_arc_set_value((lv_obj_t *)o, v); }
+
+// 0 -> full -> 0 power-on sweep so the ring "wakes up".
+static void ui_intro(void *obj, lv_anim_exec_xcb_t cb) {
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, obj);
+  lv_anim_set_exec_cb(&a, cb);
+  lv_anim_set_values(&a, 0, SPEED_RING_MAX);
+  lv_anim_set_time(&a, 650);
+  lv_anim_set_playback_time(&a, 500);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+  lv_anim_start(&a);
+  g_boot_until = lv_tick_get() + 1250;
+}
+
+static lv_obj_t *ui_rect(lv_obj_t *parent, lv_coord_t w, lv_coord_t h, lv_color_t c, lv_opa_t opa) {
+  lv_obj_t *o = lv_obj_create(parent);
+  lv_obj_remove_style_all(o);
+  lv_obj_set_size(o, w, h);
+  lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(o, c, 0);
+  lv_obj_set_style_bg_opa(o, opa, 0);
+  return o;
+}
+
+static lv_obj_t *ui_caption(lv_obj_t *parent, const char *txt, const lv_font_t *f, lv_color_t c) {
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, f, 0);
+  lv_obj_set_style_text_color(l, c, 0);
+  lv_obj_set_style_text_letter_space(l, 4, 0);
+  lv_label_set_text(l, txt);
+  return l;
+}
+
+static lv_obj_t *ui_diag_label(lv_obj_t *parent, const lv_font_t *f, lv_color_t c) {
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, f, 0);
+  lv_obj_set_style_text_color(l, c, 0);
+  lv_label_set_text(l, "");
+  return l;
+}
+
+// --------------------------------------------------------------- events -------
+static void diag_cal_event(lv_event_t *e)  { if (g_cal_cb)  g_cal_cb(); }
+static void diag_demo_event(lv_event_t *e) {
+  bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  if (g_demo_cb) g_demo_cb(on);
+}
+
+// --------------------------------------------------------------- builders -----
+static void build_gauge(lv_obj_t *p) {
+  const lv_coord_t d = g_d;
+  lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(p, ST_BG, 0);
+
+  // thick full ring, outer edge at the glass
+  g_arc = lv_arc_create(p);
+  lv_obj_set_size(g_arc, d, d);
+  lv_obj_set_style_pad_all(g_arc, 0, LV_PART_MAIN);
+  lv_obj_center(g_arc);
+  lv_arc_set_rotation(g_arc, 270);
+  lv_arc_set_bg_angles(g_arc, 0, 360);
+  lv_arc_set_range(g_arc, 0, SPEED_RING_MAX);
+  lv_arc_set_value(g_arc, 0);
+  lv_obj_remove_style(g_arc, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(g_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(g_arc, d / 22, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(g_arc, ST_TRK, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(g_arc, d / 22, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(g_arc, ST_IND, LV_PART_INDICATOR);
+
+  // fine reference tick at 12 o'clock
+  lv_obj_t *tk = ui_rect(p, 2, d / 18, ST_CAP, LV_OPA_COVER);
+  lv_obj_align(tk, LV_ALIGN_TOP_MID, 0, d * 6 / 100);
+
+  g_num = lv_label_create(p);
+  lv_obj_set_style_text_font(g_num, &speed_font_lg, 0);
+  lv_obj_set_style_text_color(g_num, ST_NUM, 0);
+  lv_label_set_text(g_num, "0");
+  lv_obj_align(g_num, LV_ALIGN_CENTER, 0, -d * 2 / 100);
+
+  lv_obj_t *u = ui_caption(p, "mph", &lv_font_montserrat_22, ST_CAP);
+  lv_obj_set_style_text_letter_space(u, 1, 0);
+  lv_obj_align(u, LV_ALIGN_BOTTOM_MID, 0, -d * 13 / 100);
+}
+
+static void build_diag(lv_obj_t *p) {
+  const lv_coord_t d = g_d;
+  lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(p, ST_BG, 0);
+
+  // centred vertical stack (kept inside the round glass)
+  lv_obj_t *col = lv_obj_create(p);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, d * 74 / 100, d * 90 / 100);
+  lv_obj_center(col);
+  lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(col, d * 2 / 100, 0);
+
+  lv_obj_t *title = lv_label_create(col);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(title, ST_NUM, 0);
+  lv_label_set_text(title, "DIAGNOSTICS");
+
+  d_speed  = ui_diag_label(col, &lv_font_montserrat_20, ST_NUM);
+  d_hz     = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
+  d_pulses = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
+  d_k      = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
+
+  // DEMO toggle row
+  lv_obj_t *row = lv_obj_create(col);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row, d * 4 / 100, 0);
+  lv_obj_t *dl = lv_label_create(row);
+  lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(dl, ST_CAP, 0);
+  lv_label_set_text(dl, "DEMO");
+  d_demo_sw = lv_switch_create(row);
+  lv_obj_set_size(d_demo_sw, d * 20 / 100, d * 10 / 100);   // bigger toggle
+  lv_obj_add_event_cb(d_demo_sw, diag_demo_event, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // CALIBRATE button (drive the known speed first, then tap)
+  lv_obj_t *btn = lv_btn_create(col);
+  lv_obj_set_size(btn, d * 52 / 100, d * 15 / 100);
+  lv_obj_set_style_bg_color(btn, ST_BTN, 0);
+  lv_obj_set_style_radius(btn, d * 4 / 100, 0);
+  lv_obj_add_event_cb(btn, diag_cal_event, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(btn);
+  lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(bl, ST_NUM, 0);
+  lv_label_set_text(bl, "CALIBRATE");
+  lv_obj_center(bl);
+
+  // calibration status line, directly below the button (auto-clears)
+  d_status = lv_label_create(col);
+  lv_obj_set_style_text_font(d_status, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(d_status, ST_NUM, 0);
+  lv_label_set_text(d_status, "");
+}
+
+// -------------------------------------------------------------- public API ----
+inline void gauge_ui_init() {
+  g_d = LV_MIN(lv_disp_get_hor_res(NULL), lv_disp_get_ver_res(NULL));
+
+  g_scr_gauge = lv_obj_create(NULL);
+  g_scr_diag  = lv_obj_create(NULL);
+  build_gauge(g_scr_gauge);
+  build_diag(g_scr_diag);
+
+  lv_scr_load(g_scr_gauge);     // start on the gauge
+  ui_intro(g_arc, ui_sweep_arc_cb);
+}
+
+// Page navigation (the diag page sits "below" the gauge).
+inline void gauge_ui_show_diag(void) {
+  if (lv_scr_act() != g_scr_diag)
+    lv_scr_load_anim(g_scr_diag, LV_SCR_LOAD_ANIM_MOVE_TOP, 250, 0, false);
+}
+inline void gauge_ui_show_gauge(void) {
+  if (lv_scr_act() != g_scr_gauge)
+    lv_scr_load_anim(g_scr_gauge, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
+}
+
+// Brief status message shown below the CALIBRATE button (auto-clears).
+inline void gauge_ui_toast(const char *msg) {
+  if (!d_status) return;
+  lv_label_set_text(d_status, msg);
+  g_toast_until = lv_tick_get() + 1800;
+}
+
+// Push live values to the diag page (cheap; safe to call every tick).
+inline void gauge_ui_set_diag(float mph, float hz, uint32_t pulses, bool demo, float dist_per_pulse) {
+  if (!d_speed) return;
+  lv_label_set_text_fmt(d_speed,  "%d mph", (int)(mph + 0.5f));
+  lv_label_set_text_fmt(d_hz,     "pulse  %d Hz", (int)(hz + 0.5f));
+  lv_label_set_text_fmt(d_pulses, "edges  %u", (unsigned)pulses);
+  lv_label_set_text_fmt(d_k,      "cal  %d umi/p", (int)(dist_per_pulse * 1e6f + 0.5f));
+  if (demo) lv_obj_add_state(d_demo_sw, LV_STATE_CHECKED);
+  else      lv_obj_clear_state(d_demo_sw, LV_STATE_CHECKED);
+}
+
+inline void gauge_ui_update(const VehicleData &d) {
+  const uint32_t now = lv_tick_get();
+
+  // Toast auto-clear runs every call (independent of the display refresh cap).
+  if (g_toast_until && now > g_toast_until) {
+    if (d_status) lv_label_set_text(d_status, "");
+    g_toast_until = 0;
+  }
+
+  // Layer 3a: cap the repaint rate (~DISPLAY_REFRESH_MS), so we don't redraw on
+  // every tick. Filtering still runs upstream at the full tick rate.
+  if (now < g_disp_next) return;
+  g_disp_next = now + DISPLAY_REFRESH_MS;
+
+  const float smoothed = d.speed_mph < 0.0f ? 0.0f : d.speed_mph;
+
+  // Layer 3b: hysteresis — only move the shown number once the smoothed value has
+  // drifted at least DISPLAY_DEADBAND from it (kills 39<->40 boundary flicker).
+  if (fabsf(smoothed - (float)g_shown) >= DISPLAY_DEADBAND)
+    g_shown = (int)lroundf(smoothed);
+
+  const int show = g_shown > SPEED_SHOW_MAX ? SPEED_SHOW_MAX : g_shown;  // cap at 99
+  const int ring = g_shown > SPEED_RING_MAX ? SPEED_RING_MAX : g_shown;  // full at 100
+  lv_label_set_text_fmt(g_num, "%d", show);
+  if (now > g_boot_until)
+    lv_arc_set_value(g_arc, ring);
+}

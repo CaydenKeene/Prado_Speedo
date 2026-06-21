@@ -1,0 +1,15 @@
+# Arduino / build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Arduino IDE / editor metadata
+.vscode/
+*.tmp
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
