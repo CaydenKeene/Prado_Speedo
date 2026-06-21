@@ -16,6 +16,8 @@ readout, a demo toggle, and a calibration button.
 - **Isolation:** a **PC817 optocoupler module** between the 12 V car side and the
   ESP32. This build uses a [1-channel PC817 isolation module](https://www.amazon.com/dp/B0DD3KBQV5)
   (screw terminals: `+ / −` on the input, `VCC / OUT / GND` on the output).
+- **Power:** the ESP32 is powered through its **USB-C port from a 12 V → USB
+  cigarette-lighter adapter**.
 
 > Full board documentation, pinouts, and driver references:
 > **https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-1.85**
@@ -107,3 +109,7 @@ learned once against a known speed:
 
 - The board starts in **demo mode** so the gauge animates on the bench without a
   live signal; flip DEMO off once wired to the car.
+- Because the ESP32 is powered from the same 12 V system (via the cigarette
+  lighter), its ground is already common with the car's. The optocoupler here
+  acts mainly as a **protective level-shifter** for the speed input rather than
+  providing full galvanic isolation.
