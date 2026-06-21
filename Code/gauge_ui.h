@@ -26,7 +26,7 @@
 //   number currently shown before we change it -> kills flip-flop at rounding
 //   boundaries (e.g. 39<->40). DISPLAY_REFRESH_MS: how often the readout is even
 //   allowed to repaint (~8 Hz) regardless of how fast we tick.
-#define DISPLAY_DEADBAND   1.0f   // mph
+#define DISPLAY_DEADBAND   0.7f   // mph
 #define DISPLAY_REFRESH_MS 120    // ~8 Hz repaint cap
 
 // Big DIN-style speedo digits (Bahnschrift, 235px, glyphs 0-9). C linkage.

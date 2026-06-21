@@ -17,7 +17,7 @@
  * native USB and frees GPIO43/44 for the speed input.
  */
 
-#define DEMO_DEFAULT  true     // start in demo so the gauge is alive on the bench
+#define DEMO_DEFAULT  false    // start on the real VSS input (flip DEMO on for the bench)
 
 #include "I2C_Driver.h"
 #include "TCA9554PWR.h"

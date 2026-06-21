@@ -34,11 +34,11 @@
 //   * (display deadband + refresh rate live in gauge_ui.h)
 #define SPEED_PIN              44        // UART-header RXD pad
 #define SPEED_AVG_EDGES        12        // N: edges in the sliding speed window
-#define SPEED_EMA_ALPHA        0.15f     // EMA factor applied to computed speed
+#define SPEED_EMA_ALPHA        0.35f     // EMA factor applied to computed speed (higher = snappier, less lag)
 #define SPEED_EDGE_BUF         16        // edge ring (MUST be power of 2 AND >= SPEED_AVG_EDGES)
 #define SPEED_GLITCH_US        150       // ignore edges closer than this (noise)
 #define SPEED_ZERO_TIMEOUT_US  800000    // no edge for 0.8 s -> exactly 0 mph
-#define SPEED_CAL_KNOWN_MPH    40.0f     // drive this (phone GPS), then tap CALIBRATE
+#define SPEED_CAL_KNOWN_MPH    24.85f    // 40 km/h in mph; drive this (phone GPS), then tap CALIBRATE
 #define SPEED_CAL_SAMPLE_MS    2500      // calibrate averages pulses over ~this long
 #define SPEED_CAL_MIN_PULSES   8         // need at least this many pulses to trust a cal
 
