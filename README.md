@@ -13,12 +13,37 @@ readout, a demo toggle, and a calibration button.
   (ST77916 360×360 round QSPI display, CST816 touch, TCA9554 IO expander, QMI8658 IMU)
 - **Speed input:** the car's SPD ("pink") wire — a square wave whose *frequency*
   is proportional to road speed — read on **GPIO44** (UART-header RX pad).
-- **Isolation:** a **PC817 optocoupler** between the 12 V car side and the ESP32.
-  Use the module variant that matches the signal voltage, and power the opto's
-  output side from the ESP32's **3.3 V** (the S3 is **not** 5 V tolerant).
+- **Isolation:** a **PC817 optocoupler module** between the 12 V car side and the
+  ESP32. This build uses a [1-channel PC817 isolation module](https://www.amazon.com/dp/B0DD3KBQV5)
+  (screw terminals: `+ / −` on the input, `VCC / OUT / GND` on the output).
 
 > Full board documentation, pinouts, and driver references:
 > **https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-1.85**
+
+### Wiring
+
+Two wires come from behind the radio: the **SPD ("pink") speed wire** and a
+**red switched 12 V** wire.
+
+**Input side (car, behind the radio):**
+
+| Optocoupler input | Wire |
+|---|---|
+| `+` (positive) | red **12 V** wire |
+| `−` (negative) | **SPD (pink)** speed wire |
+
+**Output side (ESP32):**
+
+| Optocoupler output | ESP32 pin |
+|---|---|
+| `VCC` | **3V3** |
+| `GND` | **GND** |
+| `OUT` | **GPIO44** (UART-header RX pad) |
+
+> ⚠️ Power the output side from the ESP32's **3.3 V only** — the module does not
+> step the signal down on its own; whatever you feed `VCC` is the logic-high
+> level, and the ESP32-S3 is **not** 5 V tolerant. The opto also **inverts** the
+> signal, which the firmware accounts for (it triggers on the falling edge).
 
 ## Repository layout
 
@@ -82,5 +107,3 @@ learned once against a known speed:
 
 - The board starts in **demo mode** so the gauge animates on the bench without a
   live signal; flip DEMO off once wired to the car.
-- The optocoupler **inverts** the signal — the firmware accounts for this by
-  triggering on the falling edge at the MCU pin.
