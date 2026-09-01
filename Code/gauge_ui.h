@@ -5,11 +5,11 @@
 //   1) GAUGE  — minimal "STEALTH" speedo: a thick full ring that fills with
 //      speed (full at 100) and a big centred number (capped at 99 -> 2 digits).
 //   2) DIAG   — the page "below" the gauge. Swipe UP on the gauge to reveal it,
-//      swipe DOWN to go back. Shows live car output (speed / pulse rate / edge
-//      count / calibration constant), a DEMO toggle, and a CALIBRATE button.
+//      swipe DOWN to go back. Shows live GPS output (speed / fix rate / sats /
+//      HDOP), a DEMO toggle, and a GPS INFO button.
 //
 // The UI never talks to the speed driver directly; the .ino registers two
-// callbacks (calibrate, demo-toggle) and pushes live values via gauge_ui_set_diag().
+// callbacks (gps-status, demo-toggle) and pushes live values via gauge_ui_set_diag().
 //
 // lv_conf.h needs: LV_FONT_MONTSERRAT_14/20/22, LV_USE_ARC, LV_USE_SWITCH,
 // LV_USE_BTN, LV_USE_FLEX (all on by default).
@@ -17,6 +17,8 @@
 #include "lvgl.h"
 #include "vehicle_data.h"
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #define SPEED_RING_MAX  100   // ring is full at this speed
 #define SPEED_SHOW_MAX  99    // number never shows more than this (2 digits)
@@ -28,6 +30,11 @@
 //   allowed to repaint (~8 Hz) regardless of how fast we tick.
 #define DISPLAY_DEADBAND   0.7f   // mph
 #define DISPLAY_REFRESH_MS 120    // ~8 Hz repaint cap
+
+// With GPS there is a state the VSS never had: powered up but no fix yet, where
+// a plain "0" would be a lie. The number is dimmed to the caption grey until the
+// module has a fix — no extra widgets, no layout change. Set to 0 to disable.
+#define GAUGE_DIM_ON_NO_FIX 1
 
 // Big DIN-style speedo digits (Bahnschrift, 235px, glyphs 0-9). C linkage.
 #ifdef __cplusplus
@@ -57,16 +64,17 @@ static uint32_t   g_toast_until = 0;
 static uint32_t   g_disp_next   = 0;    // next tick the readout may repaint (Layer 3)
 static int        g_shown       = 0;    // integer mph currently on screen
 
-// diag widgets
-static lv_obj_t  *d_speed, *d_hz, *d_pulses, *d_k, *d_demo_sw, *d_status;
+// diag widgets (same four value rows as before, now carrying GPS values)
+static lv_obj_t  *d_speed, *d_hz, *d_sats, *d_hdop, *d_demo_sw, *d_status;
+static bool       g_dimmed = false;     // tracks the no-fix number colour
 
 // app callbacks (set from the .ino)
-typedef void (*gauge_cal_cb_t)(void);
+typedef void (*gauge_gps_cb_t)(void);
 typedef void (*gauge_demo_cb_t)(bool);
-static gauge_cal_cb_t  g_cal_cb  = NULL;
+static gauge_gps_cb_t  g_gps_cb  = NULL;
 static gauge_demo_cb_t g_demo_cb = NULL;
-inline void gauge_ui_set_calibrate_cb(gauge_cal_cb_t cb) { g_cal_cb  = cb; }
-inline void gauge_ui_set_demo_cb(gauge_demo_cb_t cb)     { g_demo_cb = cb; }
+inline void gauge_ui_set_gps_cb(gauge_gps_cb_t cb)   { g_gps_cb  = cb; }
+inline void gauge_ui_set_demo_cb(gauge_demo_cb_t cb) { g_demo_cb = cb; }
 
 // --------------------------------------------------------------- helpers ------
 static inline int ui_spd(const VehicleData &d) {
@@ -118,7 +126,7 @@ static lv_obj_t *ui_diag_label(lv_obj_t *parent, const lv_font_t *f, lv_color_t 
 }
 
 // --------------------------------------------------------------- events -------
-static void diag_cal_event(lv_event_t *e)  { if (g_cal_cb)  g_cal_cb(); }
+static void diag_gps_event(lv_event_t *e)  { if (g_gps_cb)  g_gps_cb(); }
 static void diag_demo_event(lv_event_t *e) {
   bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
   if (g_demo_cb) g_demo_cb(on);
@@ -181,10 +189,10 @@ static void build_diag(lv_obj_t *p) {
   lv_obj_set_style_text_color(title, ST_NUM, 0);
   lv_label_set_text(title, "DIAGNOSTICS");
 
-  d_speed  = ui_diag_label(col, &lv_font_montserrat_20, ST_NUM);
-  d_hz     = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
-  d_pulses = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
-  d_k      = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
+  d_speed = ui_diag_label(col, &lv_font_montserrat_20, ST_NUM);
+  d_hz    = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
+  d_sats  = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
+  d_hdop  = ui_diag_label(col, &lv_font_montserrat_14, ST_CAP);
 
   // DEMO toggle row
   lv_obj_t *row = lv_obj_create(col);
@@ -202,19 +210,20 @@ static void build_diag(lv_obj_t *p) {
   lv_obj_set_size(d_demo_sw, d * 20 / 100, d * 10 / 100);   // bigger toggle
   lv_obj_add_event_cb(d_demo_sw, diag_demo_event, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // CALIBRATE button (drive the known speed first, then tap)
+  // GPS INFO button — same geometry as the old CALIBRATE button; GPS needs no
+  // calibration, so tapping it reports link/fix state instead.
   lv_obj_t *btn = lv_btn_create(col);
   lv_obj_set_size(btn, d * 52 / 100, d * 15 / 100);
   lv_obj_set_style_bg_color(btn, ST_BTN, 0);
   lv_obj_set_style_radius(btn, d * 4 / 100, 0);
-  lv_obj_add_event_cb(btn, diag_cal_event, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(btn, diag_gps_event, LV_EVENT_CLICKED, NULL);
   lv_obj_t *bl = lv_label_create(btn);
   lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(bl, ST_NUM, 0);
-  lv_label_set_text(bl, "CALIBRATE");
+  lv_label_set_text(bl, "GPS INFO");
   lv_obj_center(bl);
 
-  // calibration status line, directly below the button (auto-clears)
+  // status line, directly below the button (auto-clears)
   d_status = lv_label_create(col);
   lv_obj_set_style_text_font(d_status, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(d_status, ST_NUM, 0);
@@ -244,25 +253,39 @@ inline void gauge_ui_show_gauge(void) {
     lv_scr_load_anim(g_scr_gauge, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
 }
 
-// Brief status message shown below the CALIBRATE button (auto-clears).
+// Brief status message shown below the GPS INFO button (auto-clears).
 inline void gauge_ui_toast(const char *msg) {
   if (!d_status) return;
   lv_label_set_text(d_status, msg);
   g_toast_until = lv_tick_get() + 1800;
 }
 
+inline void gauge_ui_toast_fmt(const char *fmt, ...) {
+  char buf[32];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  gauge_ui_toast(buf);
+}
+
 // Push live values to the diag page (cheap; safe to call every tick).
-inline void gauge_ui_set_diag(float mph, float hz, uint32_t pulses, bool demo, float dist_per_pulse) {
+// hdop_x10 is HDOP * 10 as an integer: LVGL's printf has no float support
+// unless LV_SPRINTF_USE_FLOAT is enabled, so tenths are formatted by hand.
+inline void gauge_ui_set_diag(float mph, int fix_hz, int sats, int hdop_x10,
+                              bool demo, bool fix, bool holding) {
   if (!d_speed) return;
-  lv_label_set_text_fmt(d_speed,  "%d mph", (int)(mph + 0.5f));
-  lv_label_set_text_fmt(d_hz,     "pulse  %d Hz", (int)(hz + 0.5f));
-  lv_label_set_text_fmt(d_pulses, "edges  %u", (unsigned)pulses);
-  lv_label_set_text_fmt(d_k,      "cal  %d umi/p", (int)(dist_per_pulse * 1e6f + 0.5f));
+  lv_label_set_text_fmt(d_speed, "%d mph", (int)(mph + 0.5f));
+  lv_label_set_text_fmt(d_hz,    "fix  %d Hz", fix_hz);
+  lv_label_set_text_fmt(d_sats,  "sats  %d", sats);
+  if      (fix)     lv_label_set_text_fmt(d_hdop, "hdop  %d.%d", hdop_x10 / 10, hdop_x10 % 10);
+  else if (holding) lv_label_set_text(d_hdop, "holding");
+  else              lv_label_set_text(d_hdop, "no fix");
   if (demo) lv_obj_add_state(d_demo_sw, LV_STATE_CHECKED);
   else      lv_obj_clear_state(d_demo_sw, LV_STATE_CHECKED);
 }
 
-inline void gauge_ui_update(const VehicleData &d) {
+inline void gauge_ui_update(const VehicleData &d, bool has_fix = true) {
   const uint32_t now = lv_tick_get();
 
   // Toast auto-clear runs every call (independent of the display refresh cap).
@@ -270,6 +293,18 @@ inline void gauge_ui_update(const VehicleData &d) {
     if (d_status) lv_label_set_text(d_status, "");
     g_toast_until = 0;
   }
+
+#if GAUGE_DIM_ON_NO_FIX
+  // "0" with no fix is a lie, so grey the number until the module has one.
+  // Only touched on a state change, so it costs nothing on a normal tick.
+  const bool want_dim = !has_fix;
+  if (want_dim != g_dimmed) {
+    g_dimmed = want_dim;
+    lv_obj_set_style_text_color(g_num, g_dimmed ? ST_CAP : ST_NUM, 0);
+  }
+#else
+  (void)has_fix;
+#endif
 
   // Layer 3a: cap the repaint rate (~DISPLAY_REFRESH_MS), so we don't redraw on
   // every tick. Filtering still runs upstream at the full tick rate.

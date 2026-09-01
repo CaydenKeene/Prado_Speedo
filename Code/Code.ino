@@ -4,20 +4,17 @@
  *
  * GAUGE page (gauge_ui.h): big "STEALTH" speedo.
  * DIAG page  (below it):   swipe UP to reveal, swipe DOWN to return. Shows live
- *                          car output, a DEMO toggle, and a CALIBRATE button.
+ *                          GPS output, a DEMO toggle, and a GPS status button.
  *
- * Speed comes from the car's SPD ("pink") wire: a square wave whose FREQUENCY is
- * proportional to road speed, read as pulses on GPIO44 (UART-header RX pad)
- * through a PC817 opto-isolator. See speed_input.h for wiring & method.
- *
- * CALIBRATION: flip DEMO off, drive a steady SPEED_CAL_KNOWN_MPH (phone GPS),
- * then tap CALIBRATE. The factor is learned and saved to flash.
+ * Speed comes from a serial GPS module on the UART header (GPIO44 = RX from the
+ * module's TX). Ground speed is read straight out of the NMEA $..RMC sentence,
+ * so there is nothing to calibrate. See gps_speed.h for wiring & method.
  *
  * Arduino IDE: set "USB CDC On Boot: Enabled" so the serial console stays on
- * native USB and frees GPIO43/44 for the speed input.
+ * native USB and frees GPIO43/44 for the GPS.
  */
 
-#define DEMO_DEFAULT  false    // start on the real VSS input (flip DEMO on for the bench)
+#define DEMO_DEFAULT  false    // start on the real GPS input (flip DEMO on for the bench)
 
 #include "I2C_Driver.h"
 #include "TCA9554PWR.h"
@@ -25,11 +22,11 @@
 #include "Touch_CST816.h"
 #include "LVGL_Driver.h"
 #include "vehicle_data.h"
-#include "speed_input.h"
+#include "gps_speed.h"
 #include "gauge_ui.h"
 
 MockVehicle  vehicle;          // simulated drive cycle (demo mode)
-SpeedSensor  speedo;           // real VSS pulse input
+GpsSpeed     gps;              // real road speed from the GPS module
 VehicleData  vehicle_data;     // what the gauge reads (only speed_mph matters)
 
 static bool g_demo = DEMO_DEFAULT;
@@ -37,34 +34,42 @@ static bool g_demo = DEMO_DEFAULT;
 // ---- UI callbacks ----------------------------------------------------------
 static void on_demo_toggle(bool on) { g_demo = on; }
 
-static void on_calibrate() {
-  if (g_demo) { gauge_ui_toast("DEMO MODE"); return; }
-  // Non-blocking: averages pulses over ~SPEED_CAL_SAMPLE_MS, result polled below.
-  if (speedo.beginCalibration(SPEED_CAL_KNOWN_MPH)) gauge_ui_toast("CALIBRATING");
-  else                                              gauge_ui_toast("NO SIGNAL");
+// The diag button: GPS needs no calibration, so it reports link/fix state
+// instead. Useful when the unit is on the dash and there is no serial console.
+static void on_gps_status() {
+  if (g_demo)            { gauge_ui_toast("DEMO MODE"); return; }
+  if (!gps.linked())     { gauge_ui_toast("NO GPS");    return; }
+  if (gps.holding())     { gauge_ui_toast("HOLDING");   return; }
+  if (!gps.hasFix())     { gauge_ui_toast("SEARCHING"); return; }
+  gauge_ui_toast_fmt("FIX %d SAT", (int)gps.sats());
 }
 
 // ---- 50 ms tick: source -> gauge, diag values, page gestures ---------------
 void gauge_tick(lv_timer_t *t) {
-  float spd, hz = 0.0f, dpp = speedo.distPerPulse();
-  uint32_t pulses = speedo.pulses();
+  float    spd;
+  bool     fix     = false;
+  bool     holding = false;
+  int      sats = 0;
+  int      hdop_x10 = 0;
+  int      fix_hz   = 0;
 
   if (g_demo) {
     vehicle.update();
     spd = vehicle.data.speed_mph;
+    fix = true;                       // demo never shows the no-fix dim
   } else {
-    speedo.update();
-    spd = speedo.mph();
-    hz  = speedo.hz();
-    // Report the outcome of a running calibration once it finishes.
-    int cal = speedo.takeCalResult();
-    if      (cal > 0) gauge_ui_toast("CAL OK");
-    else if (cal < 0) gauge_ui_toast("NO SIGNAL");
+    gps.update();
+    spd      = gps.mph();
+    fix      = gps.hasFix();
+    holding  = gps.holding();
+    sats     = gps.sats();
+    hdop_x10 = (int)(gps.hdop() * 10.0f + 0.5f);
+    fix_hz   = (int)(gps.fixHz() + 0.5f);
   }
 
   vehicle_data.speed_mph = spd;
-  gauge_ui_update(vehicle_data);
-  gauge_ui_set_diag(spd, hz, pulses, g_demo, dpp);
+  gauge_ui_update(vehicle_data, fix);
+  gauge_ui_set_diag(spd, fix_hz, sats, hdop_x10, g_demo, fix, holding);
 
   // Page navigation via the latched touch gesture (swipe up = page below).
   if (Lvgl_Last_Gesture != NONE) {
@@ -85,11 +90,11 @@ void setup() {
   Lvgl_Init();
 
   gauge_ui_init();
-  gauge_ui_set_calibrate_cb(on_calibrate);
+  gauge_ui_set_gps_cb(on_gps_status);
   gauge_ui_set_demo_cb(on_demo_toggle);
 
   vehicle.begin();
-  speedo.begin();
+  gps.begin();
 
   lv_timer_create(gauge_tick, 50, NULL);
 }
